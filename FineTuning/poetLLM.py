@@ -22,7 +22,8 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    GenerationConfig
+    GenerationConfig,
+    DataCollatorForSeq2Seq
 )
 from peft import (
     LoraConfig,
@@ -32,36 +33,41 @@ from peft import (
 )
 
 def generate_training_data(data_point):
-        prompt = f"""\
-[INST] <<SYS>>
+    prompt = f"""[INST] <<SYS>>
 You are a helpful assistant and good at writing Tang poem. 你是一個樂於助人的助手且擅長寫唐詩。
 <</SYS>>
 
 {data_point["instruction"]}
 {data_point["input"]}
-[/INST]"""
-        len_user_prompt_tokens = (
-            len(
-                tokenizer(
-                    prompt,
-                    truncation=True,
-                    max_length=CUTOFF_LEN + 1,
-                    padding="max_length",
-                )["input_ids"]
-                ) - 1
-            )
+[/INST]
+"""
 
-        full_tokens = tokenizer(
-            prompt + " " + data_point["output"] + "</s>",
-            truncation=True,
-            max_length=CUTOFF_LEN + 1,
-            padding="max_length",
-        )["input_ids"][:-1]
+    prompt_ids = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=CUTOFF_LEN,
+        add_special_tokens=False,
+    )["input_ids"]
 
-        return {"input_ids": full_tokens, 
-                "labels": [-100] * len_user_prompt_tokens + full_tokens[len_user_prompt_tokens:],
-                "attention_mask": [1] * len(full_tokens)
-               }
+    output_ids = tokenizer(
+        data_point["output"] + tokenizer.eos_token,
+        truncation=True,
+        max_length=CUTOFF_LEN - len(prompt_ids),
+        add_special_tokens=False,
+    )["input_ids"]
+
+    input_ids = prompt_ids + output_ids
+
+    labels = [-100] * len(prompt_ids) + output_ids
+
+    attention_mask = [1] * len(input_ids)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+    }
+
 
 def evaluate(instruction, generation_config, max_len, input_text="", verbose=True):
             prompt = f"""\
@@ -84,7 +90,7 @@ You are a helpful assistant and good at writing Tang poem. 你是一個樂於助
             )
 
             for s in generation_output.sequences:
-                output = tokenizer.decode(s)
+                output = tokenizer.decode(s, skip_special_tokens=True)
                 output = output.split("[/INST]")[1].replace("</s>", "").replace("<s>", "").replace("Assistant:", "").replace("Assistant", "").strip()
                 if verbose:
                     print(output)
@@ -112,10 +118,8 @@ model = AutoModelForCausalLM.from_pretrained(
 logging.getLogger('transformers').setLevel(logging.ERROR)
 tokenizer = AutoTokenizer.from_pretrained(
     model_name,
-    add_eos_token=True,
     cache_dir=cache_dir
 )
-tokenizer.pad_token = tokenizer.eos_token
 max_len = 128
 generation_config = GenerationConfig(
     do_sample=True,
@@ -123,11 +127,10 @@ generation_config = GenerationConfig(
     num_beams=1,
     top_p=0.3,
     no_repeat_ngram_size=3,
-    pad_token_id=2,
 )
 
 num_train_data = 1040
-        
+
 output_dir = "./output"
 ckpt_dir = "./exp1"
 num_epoch = 1
@@ -177,8 +180,6 @@ config = LoraConfig(
 )
 model = get_peft_model(model, config)
 
-tokenizer.pad_token_id = 0
-
 with open(dataset_dir, "r", encoding="utf-8") as f:
     data_json = json.load(f)
 with open("tmp_dataset.json", "w", encoding="utf-8") as f:
@@ -194,6 +195,12 @@ if VAL_SET_SIZE > 0:
 else:
     train_data = data['train'].shuffle().map(generate_training_data)
     val_data = None
+
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model,
+    padding=True,
+)
 
 trainer = transformers.Trainer(
     model=model,
@@ -214,7 +221,7 @@ trainer = transformers.Trainer(
         ddp_find_unused_parameters=False if ddp else None,
         report_to=report_to,
     ),
-    data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    data_collator=data_collator,
 )
 
 model.config.use_cache = False
@@ -281,7 +288,6 @@ nf4_config = BitsAndBytesConfig(
 tokenizer = AutoTokenizer.from_pretrained(
     model_name,
     cache_dir=cache_dir,
-    quantization_config=nf4_config
 )
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -301,7 +307,6 @@ generation_config = GenerationConfig(
     top_p=top_p,
     # top_k=top_k,
     no_repeat_ngram_size=no_repeat_ngram_size,
-    pad_token_id=2
 )
 
 with open(test_data_path, "r", encoding="utf-8") as f:
